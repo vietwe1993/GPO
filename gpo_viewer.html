@@ -1,0 +1,465 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>GPO Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#0f1115; --panel:#151821; --muted:#8b93a7; --fg:#e6e8ef; --accent:#79c0ff; --border:#222738;
+    --ok:#18c29c; --warn:#f5a524; --err:#ef4e4e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,Segoe UI,Roboto,Arial,sans-serif}
+  .app{display:grid;grid-template-columns:300px 360px 1fr;gap:12px;height:100vh;padding:12px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;display:flex;flex-direction:column;min-height:0}
+  .header{padding:10px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+  .header h3{margin:0;font-size:14px;color:var(--accent)}
+  .body{padding:10px;overflow:auto}
+  input[type="text"]{width:100%;padding:8px 10px;background:#0c0f16;border:1px solid var(--border);border-radius:8px;color:var(--fg)}
+  .list{display:flex;flex-direction:column;gap:6px}
+  .item{padding:8px 10px;border:1px solid var(--border);border-radius:8px;cursor:pointer}
+  .item:hover{border-color:#2a3147}
+  .item.active{outline:1px solid var(--accent);background:#101625}
+  .toolbar{display:flex;gap:8px;align-items:center}
+  .badge{padding:2px 6px;border-radius:999px;font-size:12px;background:#0e1220;border:1px solid var(--border);color:var(--muted)}
+  .muted{color:var(--muted)}
+  .tree{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace}
+  .node{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:6px;cursor:pointer;user-select:none}
+  .node:hover{background:#101625}
+  .node .twist{width:14px;display:inline-flex;justify-content:center}
+  .children{margin-left:16px;border-left:1px dashed #28304a;padding-left:8px}
+  .pill{font-size:11px;padding:2px 6px;border-radius:999px;border:1px solid var(--border);color:var(--muted);background:#0c1120}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  table{width:100%;border-collapse:collapse}
+  th,td{border-bottom:1px solid var(--border);padding:6px 8px;text-align:left;vertical-align:top}
+  th{color:#a9b1c6;font-weight:600}
+  pre{background:#0b0f17;border:1px solid var(--border);border-radius:8px;padding:10px;overflow:auto}
+  .hint{font-size:12px;color:var(--muted)}
+  .status{display:inline-flex;align-items:center;gap:6px}
+  .dot{width:8px;height:8px;border-radius:50%}
+  .ok{background:var(--ok)} .bad{background:var(--err)}
+  .link{color:var(--accent);text-decoration:none}
+  .node-row{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:6px;user-select:none}
+.node-row:hover{background:#101625}
+.node-label{cursor:pointer}
+.twist{width:14px;display:inline-flex;justify-content:center;cursor:pointer;transition:transform .15s ease}
+.children{margin-left:16px;border-left:1px dashed #28304a;padding-left:8px;display:none}
+.is-expanded>.children{display:block}
+.is-expanded>.node-row .twist{transform:rotate(90deg)}
+
+</style>
+
+<div class="app">
+  <!-- LEFT: GPO LIST -->
+  <div class="card" id="panel-gpos">
+    <div class="header">
+      <h3>GPOs</h3>
+      <span class="badge" id="gpo-count">0</span>
+    </div>
+    <div class="body">
+      <input id="gpo-search" type="text" placeholder="Tìm GPO..." />
+      <div class="list" id="gpo-list" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <!-- MIDDLE: TREEVIEW -->
+  <div class="card">
+    <div class="header">
+      <h3 id="gpo-title">Chọn một GPO</h3>
+      <span class="badge" id="gpo-guid"></span>
+    </div>
+    <div class="body">
+      <div id="tree" class="tree"></div>
+      <div class="hint" id="tree-hint" style="margin-top:8px">Nhấp từng node để xem chi tiết trong panel bên phải.</div>
+    </div>
+  </div>
+
+  <!-- RIGHT: DETAILS -->
+  <div class="card">
+    <div class="header"><h3>Details</h3></div>
+    <div class="body" id="details">
+      <div class="hint">Chọn một node ở panel giữa để xem thông tin (Scripts / Security / Preferences...).</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // === Config ===
+  const API_BASE = (location.origin.includes('http') ? location.origin : 'http://localhost:5008');
+
+  // === Helpers ===
+  const $ = sel => document.querySelector(sel);
+  const el = (tag, attrs={}, ...children) => {
+    const n = document.createElement(tag);
+    Object.entries(attrs).forEach(([k,v]) => {
+      if (k === 'class') n.className = v;
+      else if (k === 'dataset') Object.entries(v).forEach(([dk,dv])=>n.dataset[dk]=dv);
+      else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
+      else n.setAttribute(k, v);
+    });
+    children.flat().forEach(c => n.append(c instanceof Node ? c : document.createTextNode(c)));
+    return n;
+  };
+  const fmt = (o) => JSON.stringify(o, null, 2);
+
+  async function api(path, params){
+    const url = new URL(API_BASE + path);
+    if(params) Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
+    const res = await fetch(url, {credentials: 'omit'});
+    if(!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
+
+// ➕ helper nhận biết LOCAL
+function isLocal(){ return currentGPO && currentGPO.guid === 'LOCAL'; }
+
+// === Load GPOs (thêm item LOCAL ở đầu danh sách)
+async function loadGPOs(){
+  const data = await api('/api/gpos');
+  const list = $('#gpo-list'); list.innerHTML = '';
+  const items = (data.items || []).sort((a,b)=>a.displayName.localeCompare(b.displayName));
+
+  // thêm LOCAL
+  const localItem = { guid: 'LOCAL', displayName: 'Local Security Policy' };
+  const full = [localItem, ...items];
+
+  $('#gpo-count').textContent = full.length;
+  const q = $('#gpo-search').value.trim().toLowerCase();
+
+  full
+    .filter(it => !q || (it.displayName||'').toLowerCase().includes(q) || (it.guid||'').toLowerCase().includes(q))
+    .forEach(it=>{
+      const node = el('div',{class:'item', onclick:()=>selectGPO(it)});
+      node.append(el('div', {class:'row'}, it.displayName || '(no name)'));
+      node.append(el('div', {class:'muted'}, it.guid));
+      list.append(node);
+    });
+}
+
+// === Select GPO -> build tree (tự chuyển endpoint nếu là LOCAL)
+let currentGPO = null;
+async function selectGPO(gpo){
+  currentGPO = gpo;
+  $('#gpo-title').textContent = gpo.displayName || '(no name)';
+  $('#gpo-guid').textContent = gpo.guid;
+
+  [...document.querySelectorAll('#gpo-list .item')].forEach(e=>e.classList.remove('active'));
+  const items = [...document.querySelectorAll('#gpo-list .item')];
+  const idx = items.findIndex(it=>it.querySelector('.muted')?.textContent===gpo.guid);
+  if(idx>=0) items[idx].classList.add('active');
+
+  const tv = isLocal()
+    ? await api(`/api/local/treeview`, { includeDetails: 'true' })
+    : await api(`/api/gpo/${gpo.guid}/treeview`, { includeDetails: 'true' });
+
+  renderTree(tv.tree);
+  $('#tree-hint').style.display='none';
+  $('#details').innerHTML = '<div class="hint">Chọn một node bên trái để xem chi tiết.</div>';
+}
+
+function renderTree(tree){
+  const root = $('#tree'); root.innerHTML = '';
+  tree.nodes.forEach(top=>{
+    const n = renderNode(top, tree.guid);
+    root.append(n);
+  });
+}
+
+
+  function renderNode(node, guid){
+    const hasChildren = !!(node.children && node.children.length);
+    const wrap = el('div', { class: 'node-wrap' });
+    const row  = el('div', { class: 'node-row', title: node.id || '', 'data-id': node.id || '' });
+    const caret = el('span', { class: 'twist' }, hasChildren ? '▸' : '');
+    const label = el('span', { class: 'node-label' }, node.label);
+
+    // click mũi tên -> toggle expand/collapse
+    if (hasChildren) {
+      caret.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        wrap.classList.toggle('is-expanded');
+      });
+      // click cả hàng (không phải nhãn) cũng toggle
+      row.addEventListener('click', (ev) => {
+        if (ev.target === row || ev.target === caret) {
+          wrap.classList.toggle('is-expanded');
+        }
+      });
+    }
+
+    // click nhãn -> load details (không toggle)
+    label.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      onNodeClick(node, guid);
+    });
+
+    row.append(caret, label);
+    wrap.append(row);
+
+    // children
+    const kids = el('div', { class: 'children' });
+    if (hasChildren) node.children.forEach(ch => kids.append(renderNode(ch, guid)));
+    wrap.append(kids);
+
+    // meta pills
+    if (node.meta){
+      const pills = [];
+      if (node.meta.startupCount!=null || node.meta.shutdownCount!=null){
+        pills.push(el('span',{class:'pill'}, `Startup:${node.meta.startupCount||0}`));
+        pills.push(el('span',{class:'pill'}, `Shutdown:${node.meta.shutdownCount||0}`));
+      }
+      if (node.meta.logonCount!=null || node.meta.logoffCount!=null){
+        pills.push(el('span',{class:'pill'}, `Logon:${node.meta.logonCount||0}`));
+        pills.push(el('span',{class:'pill'}, `Logoff:${node.meta.logoffCount||0}`));
+      }
+      if (node.meta.sections){ pills.push(el('span',{class:'pill'}, `${node.meta.sections.length} sections`)); }
+      if (node.meta.categories){ pills.push(el('span',{class:'pill'}, `${node.meta.categories.length} categories`)); }
+      if (pills.length){
+        const metaLine = el('div',{style:'margin:2px 0 0 24px; display:flex; gap:6px; flex-wrap:wrap;'});
+        pills.forEach(p=>metaLine.append(p));
+        wrap.append(metaLine);
+      }
+    }
+
+    // auto-expand một số cấp cho tiện
+    const id = (node.id || '');
+    if (
+      id === 'computer' || id === 'user' ||
+      id.endsWith('/policies') ||
+      id.endsWith('/windows-settings') ||
+      id.endsWith('/security')
+    ) {
+      wrap.classList.add('is-expanded');
+    }
+
+    return wrap;
+  }
+
+  // === Node click handler: route to details ===
+async function onNodeClick(node, guid){
+  const id = (node.id || '').trim();
+
+  // wrapper: gọi security cho LOCAL/GPO
+  const callSecurity = (params) => {
+    if (isLocal()) return api('/api/local/security', params);
+    return api(`/api/gpo/${guid}/security`, params);
+  };
+
+  try{
+    // Scripts
+    if (id.endsWith('/scripts')) {
+      if (isLocal()){
+        $('#details').innerHTML = `<div class="hint">Local: Scripts chưa hỗ trợ.</div>`;
+        return;
+      }
+      const side = id.startsWith('computer') ? 'Machine' : 'User';
+      const data = await api(`/api/gpo/${guid}/scripts`, { side });
+      renderScripts(side, data.data);
+      return;
+    }
+
+    // ---- Security: LEAF (…/security/<group>/<leaf>) ----
+    if (/\/security\/(account-policies|local-policies)\/[^/]+$/.test(id)) {
+      const side = isLocal() ? 'Machine' : (id.startsWith('computer') ? 'Machine' : 'User');
+      const sectionId = 'security/' + id.split('security/')[1];
+      const res = await callSecurity({ side, section: sectionId });
+      renderSecurity(side, res.data);
+      return;
+    }
+
+    // ---- Security: Node cha ----
+    if (id.endsWith('/security/account-policies')) {
+      const labels = (node.children || []).map(c => c.label);
+      renderCategoryIndex('Account Policies', labels);
+      return;
+    }
+    if (id.endsWith('/security/local-policies')) {
+      const labels = (node.children || []).map(c => c.label);
+      renderCategoryIndex('Local Policies', labels);
+      return;
+    }
+
+    // ---- Security: Root ----
+    if (id.endsWith('/security')) {
+      const side = isLocal() ? 'Machine' : (id.startsWith('computer') ? 'Machine' : 'User');
+      const data = await callSecurity({ side });
+      renderSecurity(side, data.data);
+      return;
+    }
+
+    // Preferences
+    if (id.startsWith('computer/preferences') || id.startsWith('user/preferences')) {
+      if (isLocal()){
+        $('#details').innerHTML = `<div class="hint">Local: Preferences chưa hỗ trợ.</div>`;
+        return;
+      }
+      const side = id.startsWith('computer') ? 'Machine' : 'User';
+      const data = await api(`/api/gpo/${guid}/preferences`, { side });
+      renderPreferences(side, data.data);
+      return;
+    }
+
+    // Admin Templates
+    if (id.endsWith('/admin-templates')) {
+      if (isLocal()){
+        $('#details').innerHTML = `<div class="hint">Local: Administrative Templates chưa hỗ trợ.</div>`;
+        return;
+      }
+      const side = id.startsWith('computer') ? 'Machine' : 'User';
+      const data = await api(`/api/gpo/${guid}/registry-pol`, { side, use_lgpo: 'false' });
+      renderAdminTemplates(side, data);
+      return;
+    }
+
+    // Fallback
+    $('#details').innerHTML = `<div class="hint">Node: ${id}</div>`;
+  } catch (err) {
+    $('#details').innerHTML = `<div class="hint">Lỗi: ${String(err).slice(0,400)}</div>`;
+  }
+}
+
+
+
+
+  // === Renderers ===
+  function renderScripts(side, data){
+    const startup = data.Startup||[], shutdown = data.Shutdown||[], logon = data.Logon||[], logoff = data.Logoff||[];
+    const isComp = side==='Machine';
+    const left = isComp
+      ? tableScripts('Startup', startup) + tableScripts('Shutdown', shutdown)
+      : tableScripts('Logon', logon)   + tableScripts('Logoff', logoff);
+
+    $('#details').innerHTML = `
+      <div class="toolbar" style="margin-bottom:8px">
+        <div class="status"><span class="dot ok"></span><b>Scripts</b> (${side})</div>
+      </div>
+      ${left}
+    `;
+  }
+
+  function tableScripts(title, arr){
+    if(!arr || !arr.length) return `
+      <div class="card" style="border:none;background:transparent">
+        <div class="muted" style="margin:6px 0">${title}: (empty)</div>
+      </div>`;
+    return `
+      <h4 style="margin:8px 0 6px">${title}</h4>
+      <table>
+        <thead><tr><th>#</th><th>Script</th><th>Parameters</th><th>PowerShell</th></tr></thead>
+        <tbody>
+          ${arr.map((x,i)=>`<tr><td>${i+1}</td><td>${x.script||''}</td><td>${x.parameters||''}</td><td>${x.isPowerShell? 'Yes':'No'}</td></tr>`).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+
+
+  function renderCategoryIndex(title, items){
+      // items: mảng nhãn con (ví dụ: ["Password Policy","Account Lockout Policy","Kerberos Policy"])
+      const rows = items.map(n => `<tr><td>${n}</td><td>${n}</td></tr>`).join('');
+      $('#details').innerHTML = `
+        <div class="toolbar" style="margin-bottom:8px">
+          <div class="status"><span class="dot ok"></span><b>${title}</b></div>
+        </div>
+        <table>
+          <thead><tr><th>Name</th><th>Description</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="2" class="muted">No items</td></tr>'}</tbody>
+        </table>
+      `;
+    }
+
+  function renderSecurity(side, data){
+    const secs = Object.keys(data||{});
+    if(!secs.length){
+      $('#details').innerHTML = `<div class="hint">Security Settings (${side}): (empty)</div>`;
+      return;
+    }
+    const html = secs.map(s=>{
+      const kv = data[s]; const rows = Object.entries(kv).map(([k,v])=>`<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+      return `<div style="margin-bottom:12px"><h4 style="margin:8px 0 6px">${s}</h4><table><tbody>${rows}</tbody></table></div>`;
+    }).join('');
+    $('#details').innerHTML = `
+      <div class="toolbar" style="margin-bottom:8px">
+        <div class="status"><span class="dot ok"></span><b>Security Settings</b> (${side})</div>
+      </div>
+      ${html}
+    `;
+  }
+
+  function renderPreferences(side, data){
+    const cats = Object.keys(data||{});
+    if(!cats.length){
+      $('#details').innerHTML = `<div class="hint">Preferences (${side}): (empty)</div>`;
+      return;
+    }
+    const html = cats.map(c=>{
+      const items = data[c]||[];
+      const rows = items.map((it, i)=>`
+        <tr>
+          <td>${i+1}</td>
+          <td>${it.name||'(unnamed)'}<div class="hint">${it.file}</div></td>
+          <td>${it.action||''}</td>
+          <td>${it.disabled? 'Disabled':'Active'}</td>
+        </tr>`).join('');
+      return `<div style="margin-bottom:12px">
+        <h4 style="margin:8px 0 6px">${c} <span class="pill">${items.length}</span></h4>
+        <table><thead><tr><th>#</th><th>Name</th><th>Action</th><th>Status</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      </div>`;
+    }).join('');
+    $('#details').innerHTML = `
+      <div class="toolbar" style="margin-bottom:8px">
+        <div class="status"><span class="dot ok"></span><b>Preferences</b> (${side})</div>
+      </div>
+      ${html}
+    `;
+  }
+
+  function renderAdminTemplates(side, data){
+    // Fallback view nếu chưa dùng LGPO.exe để parse đẹp
+    if(data.success && data.raw){
+      $('#details').innerHTML = `
+        <div class="toolbar" style="margin-bottom:8px">
+          <div class="status"><span class="dot ok"></span><b>Administrative Templates</b> (${side})</div>
+        </div>
+        <pre>${data.raw.replace(/</g,'&lt;')}</pre>
+        <div class="hint">Gợi ý: cấu hình <code>LGPO.exe</code> trên agent (config <code>lgpo_path</code>) và gọi endpoint với <code>use_lgpo=true</code> để hiển thị đúng như GPEDIT.</div>
+      `;
+    }else{
+      const exists = data.exists ? 'Yes' : 'No';
+      $('#details').innerHTML = `
+        <div class="toolbar" style="margin-bottom:8px">
+          <div class="status"><span class="dot ${data.exists?'ok':'bad'}"></span><b>Administrative Templates</b> (${side})</div>
+        </div>
+        <table>
+          <tr><th>Exists</th><td>${exists}</td></tr>
+          <tr><th>Path</th><td>${data.path||''}</td></tr>
+          ${data.size!=null?`<tr><th>Size</th><td>${data.size} bytes</td></tr>`:''}
+        </table>
+        ${data.head_hex?`<div style="margin-top:8px"><div class="muted">Head (hex)</div><pre>${data.head_hex}</pre></div>`:''}
+        <div class="hint" style="margin-top:8px">
+          Để có tên policy thân thiện, hãy đặt <code>LGPO.exe</code> trên agent và gọi
+          <a class="link" href="#" onclick="loadAdminTemplatesViaLGPO('${side}')">use_lgpo=true</a>.
+        </div>
+      `;
+      // Save for LGPO reload
+      window.__lastSide = side;
+    }
+  }
+
+  async function loadAdminTemplatesViaLGPO(sideOverride){
+    if(!currentGPO) return;
+    const side = sideOverride || window.__lastSide || 'Machine';
+    const data = await api(`/api/gpo/${currentGPO.guid}/registry-pol`, {side, use_lgpo:'true'});
+    renderAdminTemplates(side, data);
+  }
+
+  // === Init ===
+  (async function init(){
+    // Ping health (không bắt buộc)
+    try{
+      const h = await api('/health');
+      console.log('Health:', h);
+    }catch(e){ console.warn('Health check failed', e); }
+    await loadGPOs();
+  })();
+</script>

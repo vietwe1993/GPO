@@ -1,0 +1,6 @@
+{
+  "AGENT_BASE_URL": "http://192.168.193.159:8787",
+  "AGENT_API_KEY": "change-me",
+  "SERVER_BIND": "0.0.0.0",
+  "SERVER_PORT": 5008
+}
